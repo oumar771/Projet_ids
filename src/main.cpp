@@ -1,43 +1,67 @@
 #include <gtk/gtk.h>
-#include "capture.hpp"
+#include <thread>
 #include "gui.hpp"
-#include "signature.hpp" // si besoin
+#include "capture.hpp"
+#include "signature.hpp"
+
+// Thread global pour la capture
+std::thread captureThread;
+
+// Callback du bouton "Démarrer/Arrêter la capture"
+extern "C" void on_button_clicked(GtkButton *button, gpointer user_data) {
+    PacketCaptureData* data = static_cast<PacketCaptureData*>(user_data);
+    
+    if (!data->captureRunning) {
+        // Démarrer la capture dans un thread séparé
+        data->captureRunning = true;
+        captureThread = std::thread(capturePackets, data);
+        update_log("Capture démarrée.");
+    } else {
+        // Arrêter la capture
+        data->captureRunning = false;
+        if (captureThread.joinable()) {
+            captureThread.join();
+        }
+        update_log("Capture arrêtée.");
+    }
+}
 
 int main(int argc, char *argv[]) {
-    gtk_init(&argc, &argv);
+    // Initialiser l'interface via Glade (init_gui se charge de tout configurer)
+    init_gui(&argc, &argv);
 
-    // Création de la fenêtre
-    GtkWidget *window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(window), "Projet IDS");
-    g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), nullptr);
-
-    // Layout principal
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
-    gtk_container_add(GTK_CONTAINER(window), box);
-
-    // Bouton
-    GtkWidget *button = gtk_button_new_with_label("Démarrer/Arrêter la capture");
-    gtk_box_pack_start(GTK_BOX(box), button, FALSE, FALSE, 0);
-
-    // Zone de texte
-    GtkWidget *textview = gtk_text_view_new();
-    gtk_box_pack_start(GTK_BOX(box), textview, TRUE, TRUE, 0);
-
-    gtk_widget_show_all(window);
-
-    // Données de capture
+    // Préparer les données de capture
     PacketCaptureData captureData;
-    captureData.buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(textview));
     captureData.captureRunning = false;
     g_mutex_init(&captureData.mutex);
     captureData.matchFound = false;
+    
+    // Récupérer le GtkTextBuffer associé au GtkTextView et l'affecter à captureData.buffer
+    captureData.buffer = get_text_buffer();
+    
+    // Charger les signatures depuis un fichier (chemin absolu)
+    // On affecte directement le vecteur retourné à signatureDatabase.
+    captureData.signatureDatabase = load_signatures("/home/oumar_tee/Bureau/projet_ids/signatures.txt");
+    
+    // Définir des valeurs par défaut pour l'interface réseau et le filtre BPF
+    captureData.interfaceName = "wlan0"; // Assurez-vous que cette interface existe sur votre machine
+    captureData.bpfFilter = "";
 
-    // Charger les signatures par défaut
-    loadDefaultSignatures(captureData.signatureDatabase);
-
-    // Connecter le bouton
+    // Récupérer le bouton "Démarrer/Arrêter la capture" via la fonction get_capture_button()
+    GtkWidget *button = get_capture_button();
+    if (!button) {
+        g_print("Erreur: Bouton 'button_capture' non trouvé dans l'interface Glade.\n");
+        return 1;
+    }
+    // Connecter le signal "clicked" au callback on_button_clicked
     g_signal_connect(button, "clicked", G_CALLBACK(on_button_clicked), &captureData);
 
+    // Lancer la boucle principale GTK
     gtk_main();
+
+    // S'assurer que le thread de capture se termine correctement
+    if (captureThread.joinable())
+        captureThread.join();
+
     return 0;
 }
