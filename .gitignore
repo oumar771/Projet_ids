@@ -1,0 +1,6 @@
+build/
+*.o
+nids-project
+projet_ids
+interface.glade~
+.vscode/

@@ -1,158 +1,226 @@
-#include "gui.hpp"         // Pour update_log, updateTextView, etc.
 #include "capture.hpp"
-#include "signature.hpp"   // Pour match_signature et la structure Signature
-#include <iostream>
-#include <sstream>
-#include <thread>
-#include <algorithm>
-#include <exception>
+#include "gui.hpp"  // Pour avoir la définition complète de AppData et les fonctions d'interface (ex.: add_packet_to_list)
+#include <gtk/gtk.h>
 #include <tins/tins.h>
-#include <ctime>
+#include <thread>
+#include <sstream>
+#include <vector>
+#include <memory>
+#include <iomanip>
+#include <chrono>
+#include <iostream>
+#include <tuple>
+#include <fstream>
+#include <exception>
 
 using namespace Tins;
 
-// Fonctions GTK externes (définies dans gui.cpp)
-extern void updateTextView(PacketCaptureData*, const std::string&);
-extern gboolean idleUpdate(gpointer user_data);
+// --------------------------------------------------------------------------
+// Structures PCAP pour l'export
+// --------------------------------------------------------------------------
+struct pcap_hdr_t {
+    uint32_t magic_number;   // 0xa1b2c3d4
+    uint16_t version_major;  // 2
+    uint16_t version_minor;  // 4
+    int32_t  thiszone;       // Correction GMT, 0 par défaut
+    uint32_t sigfigs;        // 0 par défaut
+    uint32_t snaplen;        // Longueur max des paquets capturés (ex. 65535)
+    uint32_t network;        // 1 pour Ethernet
+};
 
-// Nouvelle version de detectSignature utilisant match_signature pour chaque signature
-void detectSignature(PacketCaptureData* captureData, const PDU& pdu) {
-    // Convertir le payload en string
-    if (auto rawPDU = pdu.find_pdu<RawPDU>()) {
-        std::string payload(rawPDU->payload().begin(), rawPDU->payload().end());
-        for (const auto &sig : captureData->signatureDatabase) {
-            if (match_signature(payload, sig)) {
-                captureData->matchFound = true;
-                captureData->matchedSignature = sig.pattern;
-                update_log("Alerte : signature détectée (" + sig.pattern + ")");
-                break;
-            }
-        }
-    }
+struct pcaprec_hdr_t {
+    uint32_t ts_sec;    // Timestamp en secondes
+    uint32_t ts_usec;   // Timestamp en microsecondes
+    uint32_t incl_len;  // Nombre d'octets enregistrés pour ce paquet
+    uint32_t orig_len;  // Longueur réelle du paquet
+};
+
+// --------------------------------------------------------------------------
+// Fonction utilitaire : format_timestamp()
+// Convertit un Tins::Timestamp en une chaîne formatée "YYYY-MM-DD HH:MM:SS.mmm"
+// --------------------------------------------------------------------------
+std::string format_timestamp(const Timestamp &ts) {
+    auto time = std::chrono::system_clock::to_time_t(
+                    std::chrono::system_clock::from_time_t(ts.seconds()));
+    std::ostringstream oss;
+    auto time_tm = *std::localtime(&time);
+    oss << std::put_time(&time_tm, "%Y-%m-%d %H:%M:%S")
+        << "." << std::setw(6) << std::setfill('0')
+        << (ts.microseconds() / 1000);
+    return oss.str();
 }
 
-// Fonction helper pour mettre à jour le GtkTreeView via le thread UI
-// On passe les informations dans un tuple : (captureData, timestamp, source IP, destination IP, protocole, alerte)
-gboolean idle_update_list(gpointer data) {
-    auto info = static_cast<std::tuple<PacketCaptureData*, std::string, std::string, std::string, std::string, std::string>*>(data);
-    PacketCaptureData* capData = std::get<0>(*info);
-    std::string timestamp = std::get<1>(*info);
-    std::string src = std::get<2>(*info);
-    std::string dst = std::get<3>(*info);
-    std::string proto = std::get<4>(*info);
-    std::string alert = std::get<5>(*info);
-    add_packet_to_list(timestamp, src, dst, proto, alert);
-    delete info;
-    return FALSE;
+// --------------------------------------------------------------------------
+// Fonction : capture_packet()
+// Extrait les informations d'un paquet capturé, met à jour l'interface via g_idle_add() 
+// (en appelant les fonctions d'affichage du module GUI) et stocke le paquet dans app->packets.
+// --------------------------------------------------------------------------
+void capture_packet(AppData *app, const Packet &packet) {
+    const PDU &pdu = *packet.pdu();
+    const EthernetII *eth = pdu.find_pdu<EthernetII>();
+    const IP *ip = pdu.find_pdu<IP>();
+
+    std::string src = eth ? eth->src_addr().to_string() : "N/A";
+    std::string dst = eth ? eth->dst_addr().to_string() : "N/A";
+    std::string proto = ip ? "IP" : "Ethernet";
+    std::string info = "Packet captured";
+    std::string timestamp = format_timestamp(packet.timestamp());
+
+    // Utilisation de g_idle_add pour effectuer la mise à jour de l'interface de manière thread-safe.
+    g_idle_add([](gpointer data) -> gboolean {
+        auto tuple_ptr = static_cast<std::tuple<AppData*, std::string, std::string,
+                                                   std::string, std::string, std::string,
+                                                   std::shared_ptr<Packet>>*>(data);
+        AppData* app = std::get<0>(*tuple_ptr);
+        std::string src = std::get<1>(*tuple_ptr);
+        std::string dst = std::get<2>(*tuple_ptr);
+        std::string proto = std::get<3>(*tuple_ptr);
+        std::string info = std::get<4>(*tuple_ptr);
+        std::string timestamp = std::get<5>(*tuple_ptr);
+        std::shared_ptr<Packet> pkt = std::get<6>(*tuple_ptr);
+        delete tuple_ptr;
+        // Mise à jour de l'affichage via la fonction déclarée dans gui.hpp
+        add_packet_to_list(app, src, dst, proto, info, timestamp);
+        // Stockage du paquet pour l'export ultérieur
+        app->packets.push_back(pkt);
+        return FALSE;
+    }, new std::tuple<AppData*, std::string, std::string,
+                        std::string, std::string, std::string,
+                        std::shared_ptr<Packet>>(
+            app, src, dst, proto, info, timestamp, std::make_shared<Packet>(packet)
+    ));
 }
 
-void capturePackets(PacketCaptureData* captureData) {
+// --------------------------------------------------------------------------
+// Fonction : sniffer_thread()
+// Configure le sniffer via libtins et lance la capture des paquets sur l'interface
+// sélectionnée dans l'UI. La boucle de capture continue tant que app->capturing est vrai.
+// --------------------------------------------------------------------------
+void sniffer_thread(AppData *app) {
     try {
-        // Utilisation de l'interface et du filtre BPF configurés dans captureData
-        std::string iface = captureData->interfaceName;   // Par ex. "wlan0" ou "enp0s3"
-        std::string bpf_filter = captureData->bpfFilter;    // Peut être vide si non défini
+        SnifferConfiguration config;
+        if (!app->filter_expression.empty()) {
+            config.set_filter(app->filter_expression);
+        }
+        config.set_promisc_mode(true);
 
-        // Configuration du sniffer avec le filtre BPF si défini
-        Tins::SnifferConfiguration config;
-        if (!bpf_filter.empty()) {
-            config.set_filter(bpf_filter);
+        // Récupération de l'interface sélectionnée depuis la combo box (valeur par défaut : "eth0")
+        gchar *iface = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(app->interface_combo));
+        std::string interface_name = (iface) ? iface : "eth0";
+        if (iface) {
+            g_free(iface);
         }
 
-        // Initialisation du sniffer avec l'interface et la configuration
-        Tins::Sniffer sniffer(iface, config);
+        // Création du sniffer sur l'interface sélectionnée
+        Sniffer sniffer(interface_name, config);
 
-        sniffer.sniff_loop([captureData](const PDU &pdu) -> bool {
-            if (!captureData->captureRunning) {
-                return false; // Arrêt de la capture si demandé
+        while (app->capturing) {
+            if (!app->paused) {
+                Packet packet = sniffer.next_packet();
+                capture_packet(app, packet);
             }
-
-            // Message de debug pour confirmer la réception d'un paquet
-            std::cout << "Paquet capturé !" << std::endl;
-            update_log("Paquet capturé sur " + captureData->interfaceName);
-
-            std::ostringstream packetDetails;
-
-            // Analyse Ethernet
-            if (const EthernetII* ethernet = pdu.find_pdu<EthernetII>()) {
-                packetDetails << "Ethernet II Frame\n";
-                packetDetails << "Source MAC: " << ethernet->src_addr() << "\n";
-                packetDetails << "Destination MAC: " << ethernet->dst_addr() << "\n";
-            }
-
-            // Analyse IP
-            std::string source_ip = "unknown";
-            std::string destination_ip = "unknown";
-            if (const IP* ip = pdu.find_pdu<IP>()) {
-                packetDetails << "IP Packet\n";
-                source_ip = ip->src_addr().to_string();
-                destination_ip = ip->dst_addr().to_string();
-                packetDetails << "Source IP: " << source_ip << "\n";
-                packetDetails << "Destination IP: " << destination_ip << "\n";
-            }
-
-            // Analyse TCP
-            std::string protocol = "unknown";
-            if (const TCP* tcp = pdu.find_pdu<TCP>()) {
-                protocol = "TCP";
-                packetDetails << "TCP Packet\n";
-                packetDetails << "Source Port: " << tcp->sport() << "\n";
-                packetDetails << "Destination Port: " << tcp->dport() << "\n";
-                if (tcp->sport() == 80 || tcp->dport() == 80) {
-                    packetDetails << "Possibilité de HTTP détecté\n";
-                }
-            }
-            // Analyse UDP
-            else if (const UDP* udp = pdu.find_pdu<UDP>()) {
-                protocol = "UDP";
-                packetDetails << "UDP Packet\n";
-                packetDetails << "Source Port: " << udp->sport() << "\n";
-                packetDetails << "Destination Port: " << udp->dport() << "\n";
-                if (udp->sport() == 53 || udp->dport() == 53) {
-                    packetDetails << "Possibilité de DNS détecté\n";
-                    if (const DNS* dns = pdu.find_pdu<DNS>()) {
-                        if (!dns->queries().empty()) {
-                            packetDetails << "DNS Query: ";
-                            for (const auto &query : dns->queries()) {
-                                packetDetails << query.dname() << " ";
-                            }
-                            packetDetails << "\n";
-                        } else {
-                            packetDetails << "DNS Response\n";
-                        }
-                    }
-                }
-            }
-            packetDetails << "\n";
-
-            // Détection de signature
-            detectSignature(captureData, pdu);
-
-            // Récupérer l'heure actuelle pour le timestamp
-            time_t now = time(0);
-            char* dt = ctime(&now);
-            std::string timestamp(dt);
-            if (!timestamp.empty() && timestamp.back() == '\n') {
-                timestamp.pop_back();
-            }
-
-            // Préparer une alerte en cas de détection de signature
-            std::string alert = captureData->matchFound ? "Signature match" : "";
-
-            // Préparer les données pour mettre à jour le GtkTreeView via le thread UI
-            auto list_data = new std::tuple<PacketCaptureData*, std::string, std::string, std::string, std::string, std::string>(
-                captureData, timestamp, source_ip, destination_ip, protocol, alert
-            );
-            g_idle_add(idle_update_list, list_data);
-
-            // Mettre à jour le GtkTextView avec les détails du paquet
-            auto text_data = new std::pair<PacketCaptureData*, std::string>(captureData, packetDetails.str());
-            g_idle_add(idleUpdate, text_data);
-
-            return true;
-        });
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    } catch(const std::exception &ex) {
+        std::cerr << "Erreur dans le thread de capture: " << ex.what() << std::endl;
     }
-    catch(const std::exception& ex) {
-        std::cerr << "Erreur lors de la capture : " << ex.what() << std::endl;
-        updateTextView(captureData, "Erreur de capture : " + std::string(ex.what()));
+}
+
+// --------------------------------------------------------------------------
+// Fonction : export_packets_to_pcap()
+// Exporte l'ensemble des paquets stockés dans app->packets dans un fichier PCAP
+// (packets.pcap) pouvant être ouvert par Wireshark.
+// --------------------------------------------------------------------------
+void export_packets_to_pcap(AppData *app) {
+    std::ofstream out("packets.pcap", std::ios::binary);
+    if (!out) {
+        std::cerr << "Erreur lors de l'ouverture du fichier packets.pcap pour écriture.\n";
+        return;
     }
+
+    // Écriture du header global PCAP
+    pcap_hdr_t global_header;
+    global_header.magic_number = 0xa1b2c3d4;
+    global_header.version_major = 2;
+    global_header.version_minor = 4;
+    global_header.thiszone = 0;
+    global_header.sigfigs = 0;
+    global_header.snaplen = 65535;
+    global_header.network = 1; // Ethernet
+
+    out.write(reinterpret_cast<const char*>(&global_header), sizeof(global_header));
+
+    // Pour chaque paquet, écrit l'enregistrement dans le fichier PCAP
+    for (const auto &pkt_ptr : app->packets) {
+        std::unique_ptr<PDU> cloned_pdu(pkt_ptr->pdu()->clone());
+        std::vector<uint8_t> data = cloned_pdu->serialize();
+
+        pcaprec_hdr_t record_header;
+        record_header.ts_sec = pkt_ptr->timestamp().seconds();
+        record_header.ts_usec = pkt_ptr->timestamp().microseconds();
+        record_header.incl_len = data.size();
+        record_header.orig_len = data.size();
+
+        out.write(reinterpret_cast<const char*>(&record_header), sizeof(record_header));
+        out.write(reinterpret_cast<const char*>(data.data()), data.size());
+    }
+    out.close();
+    std::cout << "Packets exported to packets.pcap\n";
+}
+
+// --------------------------------------------------------------------------
+// Callback du bouton "Exporter"
+// Lance l'export des paquets stockés dans app->packets dans un fichier PCAP.
+// --------------------------------------------------------------------------
+void on_export_clicked(GtkButton *button, gpointer user_data) {
+    AppData *app = static_cast<AppData *>(user_data);
+    export_packets_to_pcap(app);
+}
+
+// --------------------------------------------------------------------------
+// Callback du bouton "Démarrer/Pause"
+// Gère le démarrage, la pause et l'arrêt de la capture.
+// --------------------------------------------------------------------------
+void on_start_clicked(GtkButton *button, gpointer user_data) {
+    AppData *app = static_cast<AppData *>(user_data);
+    if (!app->capturing) {
+        const char *filter_text = gtk_entry_get_text(app->filter_entry);
+        app->filter_expression = filter_text ? std::string(filter_text) : "";
+        app->capturing = true;
+        app->paused = false;
+        std::thread(sniffer_thread, app).detach();
+        gtk_button_set_label(button, "⏸ Pause");
+    } else if (app->paused) {
+        app->paused = false;
+        gtk_button_set_label(button, "⏸ Pause");
+    } else {
+        app->capturing = false;
+        gtk_button_set_label(button, "▶ Démarrer");
+    }
+}
+
+// --------------------------------------------------------------------------
+// Callback du bouton "Pause/Reprendre" (optionnel)
+// Permet de mettre en pause ou de reprendre la capture si vous souhaitez avoir un bouton dédié.
+// --------------------------------------------------------------------------
+void on_pause_clicked(GtkButton *button, gpointer user_data) {
+    AppData *app = static_cast<AppData *>(user_data);
+    if (app->capturing && !app->paused) {
+        app->paused = true;
+        gtk_button_set_label(button, "▶ Reprendre");
+    } else if (app->capturing && app->paused) {
+        app->paused = false;
+        gtk_button_set_label(button, "⏸ Pause");
+    }
+}
+
+// --------------------------------------------------------------------------
+// Callback du bouton "Stop Capture"
+// Arrête la capture et réinitialise l'état.
+// --------------------------------------------------------------------------
+void on_stop_clicked(GtkButton *button, gpointer user_data) {
+    AppData *app = static_cast<AppData *>(user_data);
+    app->capturing = false;
+    app->paused = false;
+    gtk_button_set_label(button, "▶ Démarrer");
 }

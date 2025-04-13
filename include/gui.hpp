@@ -1,31 +1,43 @@
-#pragma once
+#ifndef GUI_HPP
+#define GUI_HPP
 
-#include <string>
 #include <gtk/gtk.h>
+#include <tins/tins.h>
+#include <string>
+#include <vector>
+#include <memory>
 
-// Initialise l'interface graphique depuis le fichier Glade.
-// argc et argv sont passés par référence afin de permettre une éventuelle modification.
-void init_gui(int* argc, char*** argv);
+// Structure regroupant l’état et les éléments de l’interface graphique.
+struct AppData {
+    GtkListStore *list_store;
+    GtkTextBuffer *hex_buffer;
+    GtkEntry *filter_entry;
+    GtkComboBox *interface_combo;
+    bool capturing;
+    bool paused;
+    std::vector<std::shared_ptr<Tins::Packet>> packets;
+    std::string filter_expression;
+};
 
-// Ajoute une ligne dans le GtkTreeView pour afficher les informations d'un paquet.
-// Les paramètres représentent respectivement le timestamp, l'adresse source, l'adresse destination,
-// le protocole et un message d'alerte.
-void add_packet_to_list(const std::string& timestamp,
-                        const std::string& source,
-                        const std::string& destination,
-                        const std::string& protocol,
-                        const std::string& alerte);
+// Déclarations des fonctions d'interface.
+void add_packet_to_list(AppData *app,
+                        const std::string &src,
+                        const std::string &dst,
+                        const std::string &proto,
+                        const std::string &info,
+                        const std::string &timestamp);
+std::string bytes_to_hex(const std::vector<uint8_t>& data, size_t start, size_t end);
+void show_packet_details(const Tins::Packet &packet);
+void on_row_activated(GtkTreeView *tree_view,
+                      GtkTreePath *path,
+                      GtkTreeViewColumn *column,
+                      gpointer user_data);
+GtkWidget* create_packet_table(AppData *app);
 
-// Met à jour le GtkTextView des logs en ajoutant un message.
-// Cette fonction peut être appelée pour afficher des alertes ou autres messages.
-void update_log(const std::string& message);
+// Déclarations des callbacks pour les boutons.
+void on_start_clicked(GtkButton *button, gpointer user_data);
+void on_stop_clicked(GtkButton *button, gpointer user_data);
+void on_pause_clicked(GtkButton *button, gpointer user_data);
+void on_export_clicked(GtkButton *button, gpointer user_data);  // <-- Assurez-vous que cette ligne est présente
 
-// Fonction de mise à jour de l'interface, utilisée via g_idle_add pour des appels thread-safe.
-// "data" peut contenir des informations à mettre à jour dans l'UI.
-gboolean idle_update_ui(gpointer data);
-
-// Récupère le bouton de capture depuis l'interface Glade.
-GtkWidget* get_capture_button();
-
-// Récupère le GtkTextBuffer associé au GtkTextView des logs.
-GtkTextBuffer* get_text_buffer();
+#endif // GUI_HPP
